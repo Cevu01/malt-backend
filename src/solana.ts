@@ -74,3 +74,87 @@ export async function verifyPureSolTransferToTreasury(
 
   return { payer: new PublicKey(payerKeyStr), amountSol };
 }
+
+import {
+  createTransferInstruction,
+  getOrCreateAssociatedTokenAccount,
+  TOKEN_PROGRAM_ID,
+} from "@solana/spl-token";
+import { Keypair } from "@solana/web3.js";
+
+const MALT_MINT = new PublicKey(process.env.MALT_MINT || "");
+const TOKEN_DECIMALS = Number(process.env.TOKEN_DECIMALS || 9);
+
+// Učitaj treasury keypair iz .env (JSON niz)
+export function loadTreasuryKeypair(): Keypair {
+  const raw = process.env.TREASURY_PRIVATE_KEY;
+  if (!raw) throw new Error("Missing TREASURY_PRIVATE_KEY");
+  const arr = Uint8Array.from(JSON.parse(raw));
+  return Keypair.fromSecretKey(arr);
+}
+
+/**
+ * Pošalji MALT (SPL) kupcu (na njegov ATA).
+ * - kreira ATA ako ne postoji
+ * - amount je u MALT (ne u smallest units)
+ * - vraća signature
+ */
+export async function sendMaltToBuyer(
+  buyerPubkey: PublicKey,
+  maltAmount: number,
+): Promise<string> {
+  if (!Number.isFinite(maltAmount) || maltAmount <= 0) {
+    throw new Error("Invalid malt amount");
+  }
+
+  const treasury = loadTreasuryKeypair();
+
+  // izračunaj u najmanjim jedinicama (decimals)
+  const units = BigInt(Math.floor(maltAmount * 10 ** TOKEN_DECIMALS));
+
+  // treasury ATA (source)
+  const sourceAta = await getOrCreateAssociatedTokenAccount(
+    connection,
+    treasury,
+    MALT_MINT,
+    treasury.publicKey,
+  );
+
+  // buyer ATA (destination)
+  const destAta = await getOrCreateAssociatedTokenAccount(
+    connection,
+    treasury, // payer za kreaciju ATA
+    MALT_MINT,
+    buyerPubkey,
+  );
+
+  // transfer instrukcija
+  const ix = createTransferInstruction(
+    sourceAta.address,
+    destAta.address,
+    treasury.publicKey,
+    Number(units), // OK je number do ~2^53; ako ti trebaju veće vrednosti, koristi spl-token 0.4+ BN varijantu
+    [],
+    TOKEN_PROGRAM_ID,
+  );
+
+  const tx = new (await import("@solana/web3.js")).Transaction().add(ix);
+  tx.feePayer = treasury.publicKey;
+
+  const { blockhash, lastValidBlockHeight } = await connection
+    .getLatestBlockhash("confirmed");
+  tx.recentBlockhash = blockhash;
+
+  tx.sign(treasury);
+
+  const sig = await connection.sendRawTransaction(tx.serialize(), {
+    skipPreflight: false,
+  });
+
+  await connection.confirmTransaction({
+    signature: sig,
+    blockhash,
+    lastValidBlockHeight,
+  }, "confirmed");
+  return sig;
+}

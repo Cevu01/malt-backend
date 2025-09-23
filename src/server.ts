@@ -1,7 +1,11 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import { RATE_MALT_PER_SOL, verifyPureSolTransferToTreasury } from "./solana";
+import {
+  RATE_MALT_PER_SOL,
+  sendMaltToBuyer,
+  verifyPureSolTransferToTreasury,
+} from "./solana";
 
 const app = express();
 
@@ -31,27 +35,28 @@ app.post("/api/purchase", async (req, res) => {
       });
     }
 
-    // 1) Verifikuj SOL transfer
+    // 1) Verifikuj SOL uplatu
     const { payer, amountSol } = await verifyPureSolTransferToTreasury(
       txSignature,
     );
 
-    // 2) Izračunaj koliko MALT ide (još ne šaljemo)
+    // 2) Koliko MALT ide
     const maltAmount = amountSol * RATE_MALT_PER_SOL;
 
-    // TODO (korak 3): slanje MALT-a kupcu pa vrati i tokenTxSignature
+    // 3) Pošalji MALT kupcu
+    const tokenSig = await sendMaltToBuyer(payer, maltAmount);
+
+    // 4) Gotovo
     return res.json({
       ok: true,
       payer: payer.toBase58(),
       amountSol,
       maltAmount,
-      msg: "Payment verified. Token transfer will be implemented in next step.",
+      tokenTx: tokenSig,
+      msg: "Payment verified and MALT sent.",
     });
   } catch (e: any) {
     console.error("purchase error:", e?.message || e);
-    return res.status(400).json({
-      ok: false,
-      error: e?.message || "Verification failed",
-    });
+    return res.status(400).json({ ok: false, error: e?.message || "Failed" });
   }
 });
