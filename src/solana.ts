@@ -1,14 +1,23 @@
 import {
   Connection,
+  Keypair,
   LAMPORTS_PER_SOL,
   ParsedInstruction,
   PartiallyDecodedInstruction,
   PublicKey,
 } from "@solana/web3.js";
+import {
+  createTransferInstruction,
+  getAssociatedTokenAddressSync,
+  getOrCreateAssociatedTokenAccount,
+  TOKEN_PROGRAM_ID,
+} from "@solana/spl-token";
 
+// === RPC (isti kao do sada) ===
 const RPC_URL = process.env.RPC_URL || "https://api.devnet.solana.com";
 export const connection = new Connection(RPC_URL, "confirmed");
 
+// === Config ===
 export const RECEIVER_ADDRESS = new PublicKey(
   process.env.RECEIVER_ADDRESS || "",
 );
@@ -19,13 +28,45 @@ export const MAX_SOL_PER_PURCHASE = Number(
   process.env.MAX_SOL_PER_PURCHASE || 100,
 );
 
-// --- TYPE GUARD ---
+// === MALT mint i decimali (za slanje MALT-a kupcu) ===
+const MALT_MINT = new PublicKey(process.env.MALT_MINT || "");
+const TOKEN_DECIMALS = Number(process.env.TOKEN_DECIMALS || 9);
+
+// --- TYPE GUARD (ostaje isto) ---
 function isParsedInstruction(
   ix: ParsedInstruction | PartiallyDecodedInstruction,
 ): ix is ParsedInstruction {
   return "parsed" in ix;
 }
 
+// === Treasury keypair (ostaje isto) ===
+export function loadTreasuryKeypair(): Keypair {
+  const raw = process.env.TREASURY_PRIVATE_KEY;
+  if (!raw) throw new Error("Missing TREASURY_PRIVATE_KEY");
+  const arr = Uint8Array.from(JSON.parse(raw));
+  return Keypair.fromSecretKey(arr);
+}
+
+/**
+ * (opciono ali bezbedno) — obezbedi da treasury ima ATA za dati mint.
+ * Owner je RECEIVER_ADDRESS (treasury wallet).
+ */
+export async function ensureTreasuryAtaForMint(
+  mint: PublicKey,
+): Promise<string> {
+  const treasury = loadTreasuryKeypair();
+  const ata = await getOrCreateAssociatedTokenAccount(
+    connection,
+    treasury, // payer za rent
+    mint, // USDC/USDT mint
+    RECEIVER_ADDRESS, // owner = treasury wallet
+  );
+  return ata.address.toBase58();
+}
+
+/**
+ * Verifikacija SOL uplate ka treasury (NE DIRAMO TVOJ LOGIKU)
+ */
 export async function verifyPureSolTransferToTreasury(
   txSignature: string,
 ): Promise<{ payer: PublicKey; amountSol: number }> {
@@ -45,9 +86,9 @@ export async function verifyPureSolTransferToTreasury(
     throw new Error(`Transaction not confirmed (status=${status})`);
   }
 
-  // 🔎 pronađi baš SystemProgram.transfer ka treasury-ju
+  // bas SystemProgram.transfer ka treasury
   const ix = tx.transaction.message.instructions.find((i) => {
-    if (!isParsedInstruction(i)) return false; // <-- uskočimo u ParsedInstruction
+    if (!isParsedInstruction(i)) return false;
     return (
       i.program === "system" &&
       i.parsed?.type === "transfer" &&
@@ -69,32 +110,109 @@ export async function verifyPureSolTransferToTreasury(
     throw new Error(`Amount exceeds max cap (${MAX_SOL_PER_PURCHASE} SOL)`);
   }
 
-  // payer = prvi account (signer) iz poruke
+  // payer = prvi potpisnik iz poruke
   const payerKeyStr = tx.transaction.message.accountKeys[0].pubkey.toBase58();
 
   return { payer: new PublicKey(payerKeyStr), amountSol };
 }
 
-import {
-  createTransferInstruction,
-  getOrCreateAssociatedTokenAccount,
-  TOKEN_PROGRAM_ID,
-} from "@solana/spl-token";
-import { Keypair } from "@solana/web3.js";
+/**
+ * Verifikacija SPL uplate (USDC/USDT) ka treasury ATA
+ * - koristi isti commitment ("confirmed") da isprati tvoj SOL flow
+ */
+export async function verifySplTokenTransferToTreasury(
+  txSignature: string,
+  expectedMint: PublicKey,
+): Promise<{ payer: PublicKey; amountTokens: number; decimals: number }> {
+  const tx = await connection.getParsedTransaction(txSignature, {
+    maxSupportedTransactionVersion: 0,
+    commitment: "confirmed",
+  });
+  if (!tx) throw new Error("Transaction not found");
+  if (tx.meta?.err) throw new Error("Transaction failed on-chain");
 
-const MALT_MINT = new PublicKey(process.env.MALT_MINT || "");
-const TOKEN_DECIMALS = Number(process.env.TOKEN_DECIMALS || 9);
+  const st = await connection.getSignatureStatus(txSignature, {
+    searchTransactionHistory: true,
+  });
+  const conf = st?.value?.confirmationStatus;
+  if (conf !== "confirmed" && conf !== "finalized") {
+    throw new Error(`Transaction not confirmed (status=${conf})`);
+  }
 
-// Učitaj treasury keypair iz .env (JSON niz)
-export function loadTreasuryKeypair(): Keypair {
-  const raw = process.env.TREASURY_PRIVATE_KEY;
-  if (!raw) throw new Error("Missing TREASURY_PRIVATE_KEY");
-  const arr = Uint8Array.from(JSON.parse(raw));
-  return Keypair.fromSecretKey(arr);
+  // očekivani treasury ATA za dati mint
+  const expectedTreasuryAta = getAssociatedTokenAddressSync(
+    expectedMint,
+    RECEIVER_ADDRESS,
+    false,
+  );
+
+  // nadji SPL transfer(Checked) ka baš tom ATA, i (ako postoji u parsed) proveri mint
+  const ix = tx.transaction.message.instructions.find((i) => {
+    // očekujemo ParsedInstruction
+    // @ts-ignore
+    if (!("parsed" in i)) return false;
+    // @ts-ignore
+    const programId = i.programId?.toBase58?.();
+    if (programId !== TOKEN_PROGRAM_ID.toBase58()) return false;
+
+    // @ts-ignore
+    const parsed: any = i.parsed;
+    const t = parsed?.type;
+    const info = parsed?.info;
+
+    if (t === "transfer" || t === "transferChecked") {
+      const dest = info?.destination;
+      const mint = info?.mint;
+      if (mint && mint !== expectedMint.toBase58()) return false;
+      return dest === expectedTreasuryAta.toBase58();
+    }
+    return false;
+  });
+  // @ts-ignore
+  if (!ix || !("parsed" in ix)) {
+    throw new Error("No valid SPL token transfer to treasury ATA found");
+  }
+
+  // izračunaj amount + decimals (iz tokenAmount ako postoji, ili iz postTokenBalances)
+  // @ts-ignore
+  const info: any = ix.parsed?.info;
+  let amountInSmallest = 0n;
+  let decimals = 0;
+
+  if (
+    info?.tokenAmount?.amount && typeof info?.tokenAmount?.decimals === "number"
+  ) {
+    amountInSmallest = BigInt(info.tokenAmount.amount);
+    decimals = info.tokenAmount.decimals;
+    if (info?.mint && info.mint !== expectedMint.toBase58()) {
+      throw new Error("Mint mismatch");
+    }
+  } else {
+    const post = tx.meta?.postTokenBalances || [];
+    const match = post.find(
+      (b) =>
+        b.owner === RECEIVER_ADDRESS.toBase58() &&
+        b.mint === expectedMint.toBase58() &&
+        b.uiTokenAmount?.decimals != null,
+    );
+    if (!match) throw new Error("Cannot resolve token decimals for transfer");
+    decimals = match.uiTokenAmount.decimals;
+
+    const amt = info?.amount;
+    if (!amt) throw new Error("Missing amount in SPL transfer");
+    amountInSmallest = BigInt(String(amt));
+  }
+  if (amountInSmallest <= 0n) throw new Error("Invalid SPL amount");
+
+  const amountTokens = Number(amountInSmallest) / Math.pow(10, decimals);
+
+  // payer = prvi potpisnik iz poruke
+  const payerKeyStr = tx.transaction.message.accountKeys[0].pubkey.toBase58();
+  return { payer: new PublicKey(payerKeyStr), amountTokens, decimals };
 }
 
 /**
- * Pošalji MALT (SPL) kupcu (na njegov ATA).
+ * Pošalji MALT (SPL) kupcu (ostaje ista logika)
  * - kreira ATA ako ne postoji
  * - amount je u MALT (ne u smallest units)
  * - vraća signature
@@ -109,7 +227,7 @@ export async function sendMaltToBuyer(
 
   const treasury = loadTreasuryKeypair();
 
-  // izračunaj u najmanjim jedinicama (decimals)
+  // izračun u najmanjim jedinicama
   const units = BigInt(Math.floor(maltAmount * 10 ** TOKEN_DECIMALS));
 
   // treasury ATA (source)
@@ -133,16 +251,19 @@ export async function sendMaltToBuyer(
     sourceAta.address,
     destAta.address,
     treasury.publicKey,
-    Number(units), // OK je number do ~2^53; ako ti trebaju veće vrednosti, koristi spl-token 0.4+ BN varijantu
+    Number(units),
     [],
     TOKEN_PROGRAM_ID,
   );
 
-  const tx = new (await import("@solana/web3.js")).Transaction().add(ix);
+  const { Transaction } = await import("@solana/web3.js");
+  const tx = new Transaction().add(ix);
   tx.feePayer = treasury.publicKey;
 
   const { blockhash, lastValidBlockHeight } = await connection
-    .getLatestBlockhash("confirmed");
+    .getLatestBlockhash(
+      "confirmed",
+    );
   tx.recentBlockhash = blockhash;
 
   tx.sign(treasury);
@@ -151,10 +272,9 @@ export async function sendMaltToBuyer(
     skipPreflight: false,
   });
 
-  await connection.confirmTransaction({
-    signature: sig,
-    blockhash,
-    lastValidBlockHeight,
-  }, "confirmed");
+  await connection.confirmTransaction(
+    { signature: sig, blockhash, lastValidBlockHeight },
+    "confirmed",
+  );
   return sig;
 }
