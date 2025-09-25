@@ -1,0 +1,45 @@
+import "dotenv/config";
+import express from "express";
+import cors from "cors";
+
+const app = express();
+
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "http://localhost:5173";
+app.use(cors({ origin: CORS_ORIGIN }));
+app.use(express.json());
+
+app.get("/ping", (_req, res) => {
+  res.json({ ok: true, via: "GET /ping" });
+});
+
+app.get("/ping", (_req, res) => {
+  res.json({ ok: true, via: "GET /ping" });
+});
+
+// Health
+app.get("/api/health", (_req, res) => {
+app.get("/__routes", (_req, res) => { const layers = (app as any)._router?.stack || []; const routes = layers.filter((l:any) => l && l.route).map((l:any) => ({ methods: Object.keys(l.route.methods), path: l.route.path })); res.json({ routes }); });
+  res.json({ ok: true, service: "malt-backend", ts: Date.now() });
+});
+
+// Test POST ruta
+app.post("/api/purchase-test", (req, res) => {
+  return res.status(200).json({ ok: true, got: req.body ?? null });
+});
+
+// Prod ruta (za sada samo validacija inputa)
+app.post("/api/purchase", (req, res) => {
+  const { txSignature } = req.body ?? {};
+  if (!txSignature) {
+    return res.status(400).json({ ok: false, error: "txSignature is required" });
+  }
+  return res.json({ ok: true, received: true, txSignature });
+});
+
+// Listen
+setImmediate(() => { try { const routes = (app as any)._router?.stack?.filter((l:any)=>l.route).map((l:any)=>({ methods: Object.keys(l.route.methods), path: l.route.path })); console.log("ROUTES:", JSON.stringify(routes)); } catch(e: any) { console.log("ROUTES_ERR", e?.message || e); } });
+const PORT = Number(process.env.PORT || 3000);
+app.listen(PORT, () => {
+  console.log(`✅ MALT backend listening on http://localhost:${PORT}`);
+  console.log(`CORS origin: ${CORS_ORIGIN}`);
+});
