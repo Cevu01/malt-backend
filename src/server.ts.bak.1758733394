@@ -17,19 +17,17 @@ app.get("/api/health", (_req, res) => {
   res.json({ ok: true, service: "malt-backend", ts: Date.now() });
 });
 
-// test ruta (mozes da ostavis dok ne zavrsimo)
-app.get(
-  "/api/purchase-test",
-  (_req, res) => res.json({ ok: true, via: "GET" }),
-);
-app.post("/api/purchase-test", (req, res) => {
-  return res.status(200).json({ ok: true, got: req.body ?? null });
+// TODO: ovde ćemo dodati POST /api/purchase i ostalo
+
+const PORT = Number(process.env.PORT || 3000);
+app.listen(PORT, () => {
+  console.log(`✅ MALT backend listening on http://localhost:${PORT}`);
+  console.log(`CORS origin: ${CORS_ORIGIN}`);
 });
 
 app.post("/api/purchase", async (req, res) => {
   try {
     const { txSignature } = req.body as { txSignature?: string };
-
     if (!txSignature) {
       return res.status(400).json({
         ok: false,
@@ -37,12 +35,12 @@ app.post("/api/purchase", async (req, res) => {
       });
     }
 
-    // 1) verifikuj SOL transfer ka treasury
+    // 1) Verifikuj SOL uplatu
     const { payer, amountSol } = await verifyPureSolTransferToTreasury(
       txSignature,
     );
 
-    // 2) izracunaj MALT
+    // 2) Koliko MALT ide
     const maltAmount = amountSol * RATE_MALT_PER_SOL;
 
     // 3) Pošalji MALT kupcu
@@ -58,6 +56,7 @@ app.post("/api/purchase", async (req, res) => {
       msg: "Payment verified and MALT sent.",
     });
   } catch (e: any) {
+    console.error("purchase error:", e?.message || e);
     return res.status(400).json({ ok: false, error: e?.message || "Failed" });
   }
 });
