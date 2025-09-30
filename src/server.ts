@@ -72,6 +72,17 @@ app.post("/api/purchase", async (req, res) => {
 
 // ---------- USDC/USDT kupovina (novi endpoint) ----------
 
+async function getSolUsd(): Promise<number> {
+  const res = await fetch(
+    "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
+  );
+  if (!res.ok) throw new Error(`Price API failed (${res.status})`);
+  const data = await res.json();
+  const price = data?.solana?.usd;
+  if (typeof price !== "number") throw new Error("Bad price payload");
+  return price;
+}
+
 // Mint-ovi (MAINNET vrednosti u .env)
 const USDC_MINT = new PublicKey(process.env.USDC_MINT!);
 const USDT_MINT = new PublicKey(process.env.USDT_MINT!);
@@ -86,8 +97,7 @@ const USDT_MINT = new PublicKey(process.env.USDT_MINT!);
   }
 })();
 
-const RATE_MALT_PER_USDC = Number(process.env.RATE_MALT_PER_USDC || 200000);
-const RATE_MALT_PER_USDT = Number(process.env.RATE_MALT_PER_USDT || 200000);
+
 
 app.post("/api/purchase-token", async (req, res) => {
   try {
@@ -110,18 +120,26 @@ app.post("/api/purchase-token", async (req, res) => {
     }
 
     const expectedMint = mintSymbol === "USDC" ? USDC_MINT : USDT_MINT;
-    const ratePerToken = mintSymbol === "USDC"
-      ? RATE_MALT_PER_USDC
-      : RATE_MALT_PER_USDT;
 
     // 1) Verifikuj SPL transfer ka treasury ATA
     const { payer, amountTokens, decimals } =
       await verifySplTokenTransferToTreasury(txSignature, expectedMint);
 
     // 2) Izračunaj MALT
-    const maltAmount = amountTokens * ratePerToken;
+    const FALLBACK_MALT_PER_USD = Number(process.env.RATE_MALT_PER_USD || 0);
+    const solUsd = await getSolUsd().catch(() => null);
+    if (!solUsd && !FALLBACK_MALT_PER_USD) {
+      return res.status(503).json({ ok: false, error: "Price service unavailable" });
+    }
+
+    const maltPerUsd =
+    solUsd ? Math.floor(RATE_MALT_PER_SOL / solUsd) : FALLBACK_MALT_PER_USD;
+    const rateApplied = maltPerUsd; // po USDC/USDT
 
     // 3) Pošalji MALT kupcu
+    const maltAmount = amountTokens * rateApplied;
+
+    // 4) Pošalji MALT kupcu
     const tokenSig = await sendMaltToBuyer(payer, maltAmount);
 
     // 4) Odgovor
@@ -132,7 +150,7 @@ app.post("/api/purchase-token", async (req, res) => {
       amountTokens,
       decimals,
       maltAmount,
-      tokenTx: tokenSig,
+      rateApplied,
       msg: "Token payment verified and MALT sent.",
     });
   } catch (e: any) {
